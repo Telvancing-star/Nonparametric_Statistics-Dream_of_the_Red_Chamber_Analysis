@@ -1,248 +1,670 @@
-import re
-import jieba
-import json
-from tqdm import tqdm
-import os
+"""
+《红楼梦》作者争议分析
+----------------------
+研究问题：前 80 回与后 40 回用词风格是否存在差异？
+
+流程概览：
+  1. 文本预处理与特征构建
+  2. 全特征非参数检验（Mann-Whitney + Bonferroni/FDR + 代表词 KS 检验）
+  3. PCA 探索性可视化 + PC1 补充检验（Mann-Whitney / KS / 置换检验）
+  4. 输出统计报告与图表
+"""
+
 import itertools
-import numpy as np
-from sklearn import decomposition
+import json
+import os
+import re
+
+import jieba
 import matplotlib.pyplot as plt
+import numpy as np
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from scipy import stats
+from sklearn import decomposition
+from tqdm import tqdm
+
+# =============================================================================
+# 全局配置
+# =============================================================================
+V = 2000                  # 每章特征维度：取高频非人名词 Top V
+N_FRONT = 80              # 前 80 回为对照组，后 40 回为比较组
+N_REP_FEATURES = 6        # 代表词数量（用于箱线图/密度图）
+N_COMPONENTS = 3          # PCA 保留主成分数
+N_PERM = 10000            # PC1 置换检验重复次数
+SCREE_COMPONENTS = 10     # 碎石图展示的主成分个数
+ALPHA = 0.05              # 显著性水平
+
+OUTPUT_DIR = 'output'
+REPORT_PATH = os.path.join(OUTPUT_DIR, 'report.txt')
+CHAPTER_DIR = '红楼梦'
+USERDICT_PATH = 'userdict.json'
+STOPWORDS_PATH = 'stopwords.txt'
+SHOW_PLOTS = False
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 
-
-# 加载别名表
-file_path = 'userdict.json'
-with open(file_path, 'r', encoding='utf-8') as f:  # 替换为正确的编码方式
-    names = json.load(f)
-for name in names:
-    for alias_name in names[name]:
-        # 结巴分词可以动态加载词语，在这里加载人物别名，以免错误的分词
-        # nr 在结巴分词中代表人名
-        jieba.add_word(alias_name, tag="nr")
-
-def load_stopwords(file_path):
-    # 加载停用词函数
+# =============================================================================
+# 第一部分：文本预处理与特征构建
+# =============================================================================
+def load_names(file_path=USERDICT_PATH):
+    """加载人物别名表，并注册到 jieba 词典（标记为人名 nr）。"""
     with open(file_path, 'r', encoding='utf-8') as f:
-        stopwords = [line.strip('\n') for line in f.readlines()]
-    return stopwords
+        names = json.load(f)
+    for name in names:
+        for alias_name in names[name]:
+            jieba.add_word(alias_name, tag='nr')
+    return names
 
-def process(file_path):
-    # 对一个章节进行分词
-    stopwords = load_stopwords('stopwords.txt')
+
+def load_stopwords(file_path=STOPWORDS_PATH):
+    """加载停用词表。"""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return [line.strip('\n') for line in f.readlines()]
+
+
+def tokenize_chapter(file_path, stopwords):
+    """对单章文本分词，过滤单字词与停用词，返回段落级词列表。"""
     with open(file_path, 'rb') as f:
         content = f.read()
-        para = content.decode("utf-8", 'ignore').split('\n')
-        para = para[:-1]
-        result = []
-        for p in para:
-            words = []
-            # 对每一个段落进行分词
-            seg_list = list(jieba.cut(p, cut_all=False))
-            for x in seg_list:
-                if len(x) <= 1:
-                    continue
-                if x in stopwords:
-                    continue
-                words.append(x)
-            # 返回的是一个二维 list: [[段1结果], [段2结果], ]
-            result.append(words)
+    para = content.decode('utf-8', 'ignore').split('\n')[:-1]
+    result = []
+    for p in para:
+        words = []
+        for x in jieba.cut(p, cut_all=False):
+            if len(x) <= 1 or x in stopwords:
+                continue
+            words.append(x)
+        result.append(words)
     return result
 
-result = {}
 
-# 遍历目录
-for file_name in tqdm(os.listdir('红楼梦')):
-    # 获取章节的坐标，前面爬取的数据，是以 1_章节名 命名
-    index = int(file_name.split('_')[0])
-    # 分词，保存到一个字典，章节坐标对应分词结果
-    result[index] = process(os.path.join('红楼梦', file_name))
+def tokenize_all_chapters(chapter_dir=CHAPTER_DIR):
+    """遍历各章分词，返回 {章节号: [[段1词列表], ...]}。"""
+    stopwords = load_stopwords()
+    result = {}
+    for file_name in tqdm(os.listdir(chapter_dir), desc='分词'):
+        index = int(file_name.split('_')[0])
+        result[index] = tokenize_chapter(os.path.join(chapter_dir, file_name), stopwords)
+    return result
 
-#词频统计----------------------------------------
 
-artical_word_dict = {}  # 整篇文章分词结果
-chapters_word_dict = {}  # 每个章节的分词结果，对应到文章索引
+def build_word_freq(tokenized):
+    """统计全书词频与各章词频。"""
+    artical_word_dict = {}
+    chapters_word_dict = {}
+    for index in tokenized:
+        chapter_word_list = list(itertools.chain.from_iterable(tokenized[index]))
+        chapter_word_dict = {}
+        for word in chapter_word_list:
+            chapter_word_dict[word] = chapter_word_dict.get(word, 0) + 1
+            artical_word_dict[word] = artical_word_dict.get(word, 0) + 1
+        chapters_word_dict[index] = chapter_word_dict
+    sorted_word_list = [
+        word for _, word in sorted(
+            zip(artical_word_dict.values(), artical_word_dict.keys()), reverse=True)
+    ]
+    return chapters_word_dict, sorted_word_list
 
-# 遍历上文的分词结果
-for index in tqdm(result):
-    # 将一个章节的二维 list 压缩为一维，方便遍历
-    chapter_word_list = list(itertools.chain.from_iterable(result[index]))
-    chapter_word_dict = {}
-    # 遍历
-    for word in chapter_word_list:
-        # 当词语不存在时 dict 初始化为 0
-        if word not in chapter_word_dict:
-            chapter_word_dict[word] = 0
-        # 当词语不存在时 dict 初始化为 0
-        if word not in artical_word_dict:
-            artical_word_dict[word] = 0
-        # 相应结果加一
-        chapter_word_dict[word] += 1
-        artical_word_dict[word] += 1
-    chapters_word_dict[index] = chapter_word_dict
 
-# 对整篇文章的词频统计结果进行排序，由高到低
-sorted_word_list = [x[1] for x in sorted(
-    zip(artical_word_dict.values(), artical_word_dict.keys()), reverse=True)]
-sorted_word_list
+def remove_person_names(sorted_word_list, names):
+    """从高频词列表中剔除人物名，避免人名主导风格特征。"""
+    all_names = [alias for aliases in names.values() for alias in aliases]
+    filtered = []
+    for word in sorted_word_list:
+        is_name = any(re.search(re.compile(f'(.*){name}(.*)'), word) for name in all_names)
+        if not is_name:
+            filtered.append(word)
+    return filtered
 
-#数据分析及可视化----------------------------
-#分析是否为曹雪芹所作
 
-all_names = []  # 所有名字的 list
-for name in names:
-    for alias_name in names[name]:
-        all_names.append(alias_name)
+def build_feature_matrix(chapters_word_dict, word_list):
+    """
+    构建章节 × 词语 特征矩阵（120 × V）。
+    行按章节号 1–120 排序；列按 word_list 顺序；值为归一化词频。
+    """
+    chapter_ids = sorted(chapters_word_dict.keys())
+    features = np.zeros((len(chapter_ids), len(word_list)))
+    for i, chap_id in enumerate(chapter_ids):
+        chapter_word_dict = chapters_word_dict[chap_id]
+        for j, word in enumerate(word_list):
+            features[i, j] = chapter_word_dict.get(word, 0)
+    # 按列归一化到 [0, 1]，消除词频绝对量级差异
+    col_max = features.max(axis=0)
+    col_max[col_max == 0] = 1
+    features /= col_max
+    return features, chapter_ids
 
-# 待删除的名字
-to_delete = []
-for x in tqdm(sorted_word_list):
-    for name in all_names:
-        # 利用正则表达式判断一个词语是否是名字
-        pattern = re.compile("(.*){}(.*)".format(name))
-        # 正则查找匹配，如果匹配的结果不为 None 则该词语为名字
-        t = re.search(pattern, x)
-        # 如果一个词语是名字，则删除掉
-        if t:
-            to_delete.append(x)
+
+def prepare_features():
+    """预处理流水线：分词 → 词频 → 去人名 → 特征矩阵。"""
+    names = load_names()
+    tokenized = tokenize_all_chapters()
+    chapters_word_dict, sorted_word_list = build_word_freq(tokenized)
+    filtered_words = remove_person_names(sorted_word_list, names)
+    word_list = filtered_words[:V]
+    features, chapter_ids = build_feature_matrix(chapters_word_dict, word_list)
+    return features, word_list, chapter_ids
+
+
+# =============================================================================
+# 第二部分：全特征非参数检验（核心推断）
+# =============================================================================
+def rank_biserial(u_stat, n1, n2):
+    """Mann-Whitney U 检验的 rank-biserial 效应量。"""
+    return 1 - (2 * u_stat) / (n1 * n2)
+
+
+def mann_whitney_two_sample(x, y):
+    """两独立样本 Mann-Whitney U 检验。"""
+    res = stats.mannwhitneyu(x, y, alternative='two-sided')
+    r = rank_biserial(res.statistic, len(x), len(y))
+    return {'U': res.statistic, 'p': res.pvalue, 'rank_biserial_r': r}
+
+
+def ks_two_sample(x, y):
+    """两独立样本 Kolmogorov-Smirnov 检验。"""
+    res = stats.ks_2samp(x, y)
+    return {'statistic': res.statistic, 'p': res.pvalue}
+
+
+def feature_wise_tests(features, word_list, n_front=N_FRONT, alpha=ALPHA):
+    """
+    对全部 V 个词频特征逐一做 Mann-Whitney U 检验，
+    并进行 Bonferroni 与 FDR (BH) 多重比较校正。
+    另对 Top 代表词补充 KS 检验，供可视化解读。
+    """
+    x_front = features[:n_front]
+    x_back = features[n_front:]
+    n_features = features.shape[1]
+    u_stats = np.zeros(n_features)
+    p_values = np.zeros(n_features)
+    effect_sizes = np.zeros(n_features)
+
+    for j in tqdm(range(n_features), desc='逐词 Mann-Whitney'):
+        res = stats.mannwhitneyu(x_front[:, j], x_back[:, j], alternative='two-sided')
+        u_stats[j] = res.statistic
+        p_values[j] = res.pvalue
+        effect_sizes[j] = rank_biserial(res.statistic, n_front, len(x_back))
+
+    bonferroni_p = np.minimum(p_values * n_features, 1.0)
+    fdr_p = stats.false_discovery_control(p_values, method='bh')
+
+    sig_raw = int(np.sum(p_values < alpha))
+    sig_bonf = int(np.sum(bonferroni_p < alpha))
+    sig_fdr = int(np.sum(fdr_p < alpha))
+
+    # Top 差异词（按原始 p 值）
+    order = np.argsort(p_values)
+    top_records = []
+    for idx in order[:15]:
+        top_records.append({
+            'word': word_list[idx],
+            'U': u_stats[idx],
+            'p': p_values[idx],
+            'bonferroni_p': bonferroni_p[idx],
+            'fdr_p': fdr_p[idx],
+            'rank_biserial_r': effect_sizes[idx],
+        })
+
+    # FDR 显著词
+    fdr_sig_indices = np.where(fdr_p < alpha)[0]
+    fdr_sig_sorted = fdr_sig_indices[np.argsort(p_values[fdr_sig_indices])]
+    top_fdr_words = [
+        {
+            'word': word_list[idx],
+            'p': p_values[idx],
+            'fdr_p': fdr_p[idx],
+            'rank_biserial_r': effect_sizes[idx],
+        }
+        for idx in fdr_sig_sorted[:15]
+    ]
+
+    # 代表词：优先从 FDR 显著词中选取，不足则回退到原始 p 值 Top 词
+    rep_source = top_fdr_words if top_fdr_words else top_records
+    representative = []
+    seen_words = set()
+    for rec in rep_source:
+        word = rec['word']
+        if word in seen_words:
+            continue
+        seen_words.add(word)
+        idx = word_list.index(word)
+        front_vals = x_front[:, idx]
+        back_vals = x_back[:, idx]
+        mw = mann_whitney_two_sample(front_vals, back_vals)
+        ks = ks_two_sample(front_vals, back_vals)
+        representative.append({
+            'word': word,
+            'index': idx,
+            'U': mw['U'],
+            'p': rec.get('p', p_values[idx]),
+            'bonferroni_p': bonferroni_p[idx],
+            'fdr_p': rec.get('fdr_p', fdr_p[idx]),
+            'rank_biserial_r': mw['rank_biserial_r'],
+            'ks_D': ks['statistic'],
+            'ks_p': ks['p'],
+        })
+        if len(representative) >= N_REP_FEATURES:
             break
 
-# 删除操作
-for x in to_delete:
-    sorted_word_list.remove(x)
+    return {
+        'p_values': p_values,
+        'bonferroni_p': bonferroni_p,
+        'fdr_p': fdr_p,
+        'effect_sizes': effect_sizes,
+        'sig_raw': sig_raw,
+        'sig_bonferroni': sig_bonf,
+        'sig_fdr': sig_fdr,
+        'top_records': top_records,
+        'top_fdr_words': top_fdr_words,
+        'representative': representative,
+    }
 
-V = 2000  # 选择前 V 个词语的词频作为一章节的特征
-word_list = sorted_word_list[:V]
-word_list
+
+# =============================================================================
+# 第三部分：PCA 降维 + PC1 补充检验
+# =============================================================================
+def run_pca(features, n_components=N_COMPONENTS, scree_components=SCREE_COMPONENTS):
+    """
+    对特征矩阵做 PCA 降维。
+    返回：前 n_components 维得分、所选成分解释率、完整碎石图数据。
+    """
+    n_scree = min(scree_components, features.shape[0], features.shape[1])
+    pca_full = decomposition.PCA(n_components=n_scree)
+    pca_full.fit(features)
+    scores = pca_full.transform(features)[:, :n_components]
+    return scores, pca_full.explained_variance_ratio_[:n_components], pca_full.explained_variance_ratio_
 
 
+def _pc1_mean_diff(pc1, labels):
+    """PC1 上两组样本均值的绝对差，用作置换检验统计量。"""
+    front_mean = pc1[labels == 0].mean()
+    back_mean = pc1[labels == 1].mean()
+    return abs(front_mean - back_mean)
 
-# 在这里生成一个 120*2000 的 0 矩阵，每一行对应一章节的特征。
-features = np.zeros((len(chapters_word_dict), V))
-# 遍历每个章节的 word dict
-for index in chapters_word_dict:
-    # 章节 word dict
-    chapter_word_dict = chapters_word_dict[index]
-    # 遍历每个词语，并改变相应位置的值为该词语出现次数
-    for j, word in enumerate(word_list):
+
+def permutation_test_pc1(scores, n_front=N_FRONT, n_perm=N_PERM, seed=42):
+    """
+    PC1 置换检验：在原标签下计算两组 PC1 均值差，
+    重复打乱组标签，构造零分布并计算 p 值。
+    """
+    rng = np.random.default_rng(seed)
+    pc1 = scores[:, 0]
+    labels = np.array([0] * n_front + [1] * (len(scores) - n_front))
+    t_obs = _pc1_mean_diff(pc1, labels)
+    count = 0
+    for _ in range(n_perm):
+        perm_labels = rng.permutation(labels)
+        if _pc1_mean_diff(pc1, perm_labels) >= t_obs:
+            count += 1
+    p_value = (count + 1) / (n_perm + 1)
+    return {'T_obs': t_obs, 'p': p_value, 'n_perm': n_perm}
+
+
+def pc1_tests(scores, n_front=N_FRONT):
+    """
+    对第一主成分（PC1）做三项非参数检验：
+    Mann-Whitney U、Kolmogorov-Smirnov、置换检验。
+    PC1 解释方差最大，作为 PCA 方向的代表性检验。
+    """
+    pc1_front = scores[:n_front, 0]
+    pc1_back = scores[n_front:, 0]
+    return {
+        'mann_whitney': mann_whitney_two_sample(pc1_front, pc1_back),
+        'ks': ks_two_sample(pc1_front, pc1_back),
+        'permutation': permutation_test_pc1(scores, n_front=n_front),
+    }
+
+
+# =============================================================================
+# 第四部分：可视化
+# =============================================================================
+def _save_fig(name):
+    """保存当前图像到 output/ 目录。"""
+    path = os.path.join(OUTPUT_DIR, name)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return path
+
+
+# --- 4.1 全特征检验相关图表 ---
+
+def plot_top_words(feature_results):
+    """差异最显著词语的 -log10(p) 条形图。"""
+    words_data = feature_results['top_fdr_words']
+    if not words_data:
+        words_data = feature_results['top_records'][:15]
+
+    words = [d['word'] for d in words_data]
+    neg_log_p = [-np.log10(max(d['p'], 1e-300)) for d in words_data]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y_pos = np.arange(len(words))
+    ax.barh(y_pos, neg_log_p, color='steelblue')
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(words)
+    ax.invert_yaxis()
+    ax.set_xlabel(r'$-\log_{10}(p)$')
+    ax.set_title('差异最显著的前 15 个词语（Mann-Whitney）')
+    ax.axvline(-np.log10(ALPHA), color='red', linestyle='--', linewidth=0.8, label=f'α={ALPHA}')
+    ax.legend()
+    return _save_fig('top_diff_words.png')
+
+
+def plot_feature_boxplots(features, representative, n_front=N_FRONT):
+    """代表词的归一化词频箱线图（前 80 回 vs 后 40 回）。"""
+    n_rep = len(representative)
+    n_cols = min(3, n_rep)
+    n_rows = (n_rep + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for ax, rec in zip(axes, representative):
+        idx = rec['index']
+        data_front = features[:n_front, idx]
+        data_back = features[n_front:, idx]
+        ax.boxplot([data_front, data_back], tick_labels=['前 80 回', '后 40 回'])
+        jitter_front = np.random.default_rng(0).uniform(-0.08, 0.08, len(data_front))
+        jitter_back = np.random.default_rng(1).uniform(-0.08, 0.08, len(data_back))
+        ax.scatter(1 + jitter_front, data_front, alpha=0.4, s=15, color='C0')
+        ax.scatter(2 + jitter_back, data_back, alpha=0.4, s=15, color='C1')
+        ax.set_title(f'「{rec["word"]}」  p={rec["p"]:.2e}')
+        ax.set_ylabel('归一化词频')
+
+    for ax in axes[n_rep:]:
+        ax.set_visible(False)
+
+    fig.suptitle('代表性差异词语 — 分组箱线图')
+    return _save_fig('feature_boxplot.png')
+
+
+def plot_feature_density(features, representative, n_front=N_FRONT):
+    """代表词的分布密度对比图（直方图 + KDE）。"""
+    n_rep = len(representative)
+    n_cols = min(3, n_rep)
+    n_rows = (n_rep + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
+
+    for ax, rec in zip(axes, representative):
+        idx = rec['index']
+        data_front = features[:n_front, idx]
+        data_back = features[n_front:, idx]
+        ax.hist(data_front, bins=15, density=True, alpha=0.5, label='前 80 回')
+        ax.hist(data_back, bins=15, density=True, alpha=0.5, label='后 40 回')
         try:
-            features[index, j] = chapter_word_dict[word]
-        except:
-            # 该章节未出现这个词语
+            x_front = np.linspace(data_front.min(), data_front.max(), 200)
+            x_back = np.linspace(data_back.min(), data_back.max(), 200)
+            ax.plot(x_front, stats.gaussian_kde(data_front)(x_front))
+            ax.plot(x_back, stats.gaussian_kde(data_back)(x_back))
+        except np.linalg.LinAlgError:
             pass
-features.shape, features
+        ax.set_title(f'「{rec["word"]}」  KS p={rec["ks_p"]:.2e}')
+        ax.set_xlabel('归一化词频')
+        ax.legend(fontsize=8)
 
-features /= features.max(axis=0)  # 按列归一化到 [0, 1]
-features.shape, features
+    for ax in axes[n_rep:]:
+        ax.set_visible(False)
 
-
-
-
-# 特征降维
-features = decomposition.PCA(n_components=2).fit_transform(features)
-
-# 绘制前八十回和后四十回散点图
-plt.plot(features[:80, 0].flatten(), features[:80, 1].flatten(), '.')
-plt.plot(features[80:, 0].flatten(), features[80:, 1].flatten(), '.')
-plt.legend(['First 80', 'Last 40'])
+    fig.suptitle('代表性差异词语 — 分布密度对比')
+    return _save_fig('feature_density.png')
 
 
+def run_feature_visualization(features, feature_results):
+    """生成全特征检验相关的全部图表。"""
+    return [
+        plot_top_words(feature_results),
+        plot_feature_boxplots(features, feature_results['representative']),
+        plot_feature_density(features, feature_results['representative']),
+    ]
 
-#人物关系绘制--------------
-# 统计一起出现的次数
-count = {}
-for comb in itertools.product(names.keys(), repeat=2):
-    count['_'.join(comb)] = 0
 
-# 遍历章节词语
-for para_word_list in tqdm(list(itertools.chain.from_iterable(result.values()))):
-    para_name_list = []
-    for name in names:
-        tmp = set(names[name]).intersection(para_word_list)
-        if len(tmp)>0:
-            para_name_list.append(name)
-    # 去重
-    para_name_list = list(set(para_name_list))
-    # 统计一段中共同出现的次数
-    for comb in itertools.combinations(para_name_list, 2):
-        count['_'.join(comb)] += 1
-        
+# --- 4.2 PCA 探索性可视化图表 ---
 
-from plotly.offline import init_notebook_mode, iplot
-from plotly import graph_objs as go
-import networkx as nx
-# 激活 Plotly notebook 模式，方便离线绘图
-init_notebook_mode(connected=True)
-G = nx.Graph()  # 创建 Graph
-nodes = []  # 所有节点
-edges = []  # 所有边
-# 统计所有名字的组合
-for comb in itertools.combinations(names.keys(), 2):
-    # 两个名字一起出现的次数
-    total = count['{}_{}'.format(comb[0], comb[1])] + \
-        count['{}_{}'.format(comb[1], comb[0])]
-    # 如果一起出现了，才保存
-    if total > 0:
-        edges.append((comb[0], comb[1], {'weight': total}))
-        nodes.append(comb[0])
-        nodes.append(comb[1])
+def plot_pca_scatter(scores, n_front=N_FRONT):
+    """PCA 三维散点图：前 80 回 vs 后 40 回。"""
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(
+        scores[:n_front, 0], scores[:n_front, 1], scores[:n_front, 2],
+        alpha=0.7, label='前 80 回', s=30,
+    )
+    ax.scatter(
+        scores[n_front:, 0], scores[n_front:, 1], scores[n_front:, 2],
+        alpha=0.7, label='后 40 回', s=30,
+    )
+    ax.set_xlabel('PC1')
+    ax.set_ylabel('PC2')
+    ax.set_zlabel('PC3')
+    ax.set_title('PCA 三维散点图：前 80 回 vs 后 40 回')
+    ax.legend()
+    return _save_fig('pca_scatter.png')
 
-nodes = list(set(nodes))  # 去除重复节点
-G.add_nodes_from(nodes)  # 添加节点和边
-G.add_edges_from(edges)
 
-# 节点对应到图上的坐标 (x, y)
-pos = nx.spring_layout(G)
-pos
+def plot_scree(explained_ratio_full):
+    """PCA 碎石图：展示各主成分方差解释率。"""
+    fig, ax = plt.subplots(figsize=(8, 4))
+    x = np.arange(1, len(explained_ratio_full) + 1)
+    ax.bar(x, explained_ratio_full * 100, alpha=0.7, label='单个主成分')
+    ax.plot(x, np.cumsum(explained_ratio_full) * 100, 'o-', color='C1', label='累计解释率')
+    ax.set_xlabel('主成分')
+    ax.set_ylabel('方差解释率 (%)')
+    ax.set_title('PCA 碎石图')
+    ax.legend()
+    return _save_fig('pca_scree.png')
 
-# 绘制边的轨迹
-edge_trace = go.Scatter(x=[], y=[], line=dict(
-    width=0.5, color='#888'), hoverinfo='none', mode='lines')
 
-# 遍历每一条边，根据上文获得的每一个节点的坐标，连接两个节点
-for edge in G.edges():
-    x0, y0 = pos[edge[0]]
-    x1, y1 = pos[edge[1]]
-    edge_trace['x'] += tuple([x0, x1, None])
-    edge_trace['y'] += tuple([y0, y1, None])
+def plot_pc1_boxplot(scores, pc1_results, n_front=N_FRONT):
+    """PC1 分组箱线图（含散点抖动）。"""
+    mw_p = pc1_results['mann_whitney']['p']
+    fig, ax = plt.subplots(figsize=(6, 4))
+    data_front = scores[:n_front, 0]
+    data_back = scores[n_front:, 0]
+    ax.boxplot([data_front, data_back], tick_labels=['前 80 回', '后 40 回'])
+    jitter_front = np.random.default_rng(0).uniform(-0.08, 0.08, len(data_front))
+    jitter_back = np.random.default_rng(1).uniform(-0.08, 0.08, len(data_back))
+    ax.scatter(1 + jitter_front, data_front, alpha=0.4, s=20, color='C0')
+    ax.scatter(2 + jitter_back, data_back, alpha=0.4, s=20, color='C1')
+    ax.set_title(f'PC1 分组箱线图  Mann-Whitney p={mw_p:.2e}')
+    ax.set_ylabel('PC1 得分')
+    return _save_fig('pc1_boxplot.png')
 
-# 绘制点
-node_trace = go.Scatter(x=[], y=[], text=[], mode='markers', hoverinfo='text',
-                        marker=dict(showscale=True, colorscale='YlGnBu', reversescale=True,
-                                    color=[], size=10,
-                                    colorbar=dict(thickness=15, title='Node Connections',
-                                                  xanchor='left', titleside='right'),
-                                    line=dict(width=2)))
-# 遍历每一个点
-for node in G.nodes():
-    x, y = pos[node]
-    node_trace['x'] += tuple([x])
-    node_trace['y'] += tuple([y])
-    
-# 遍历邻接列表，对应了 节点 → 一条边的另一个节点和权重
-for node, adjacencies in enumerate(G.adjacency()):
-    # 把所有边的次数累加，据此对每一个点添加颜色，出现次数越多颜色越深（除以 5000 防止超出范围）
-    node_trace['marker']['color'] += tuple(
-        [sum([adjacencies[1][name]['weight'] for name in adjacencies[1]])/5000])
-    node_info = adjacencies[0]
-    # 每一个节点添加标注信息（名字）
-    node_trace['text'] += tuple([node_info])
-    
-fig = go.Figure(data=[edge_trace, node_trace], layout=go.Layout(
-                width=1000,  # 设置图形宽度为800像素
-                height=1000,  # 设置图层安高为600像素
-                title='红楼梦人物关系网络图', titlefont=dict(size=16),
-                showlegend=False, hovermode='closest',
-                margin=dict(b=20, l=5, r=5, t=40),
-                annotations=[dict(
-                    text="楼+ 数据分析与挖掘实战", showarrow=False,
-                    xref="paper", yref="paper", x=0.005, y=-0.002)],
-                xaxis=dict(showgrid=False, zeroline=False,
-                           showticklabels=False),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)))
 
-# 绘制图像
+def plot_pc1_density(scores, pc1_results, n_front=N_FRONT):
+    """PC1 分组分布密度对比图。"""
+    ks_p = pc1_results['ks']['p']
+    fig, ax = plt.subplots(figsize=(6, 4))
+    data_front = scores[:n_front, 0]
+    data_back = scores[n_front:, 0]
+    ax.hist(data_front, bins=20, density=True, alpha=0.5, label='前 80 回')
+    ax.hist(data_back, bins=20, density=True, alpha=0.5, label='后 40 回')
+    try:
+        x_front = np.linspace(data_front.min(), data_front.max(), 200)
+        x_back = np.linspace(data_back.min(), data_back.max(), 200)
+        ax.plot(x_front, stats.gaussian_kde(data_front)(x_front), label='前 80 回 KDE')
+        ax.plot(x_back, stats.gaussian_kde(data_back)(x_back), label='后 40 回 KDE')
+    except np.linalg.LinAlgError:
+        pass
+    ax.set_title(f'PC1 分布对比  KS p={ks_p:.2e}')
+    ax.set_xlabel('PC1 得分')
+    ax.legend(fontsize=8)
+    return _save_fig('pc1_density.png')
 
-iplot(fig)
-    
-# 显示图形
-plt.show()
+
+def run_pca_analysis(features):
+    """
+    PCA 降维、PC1 三项检验，并生成相关图表。
+    返回：scores, pca_ratio, pc1_results, 图表路径列表。
+    """
+    scores, pca_ratio, explained_full = run_pca(features)
+    pc1_results = pc1_tests(scores)
+    paths = [
+        plot_pca_scatter(scores),
+        plot_scree(explained_full),
+        plot_pc1_boxplot(scores, pc1_results),
+        plot_pc1_density(scores, pc1_results),
+    ]
+    return scores, pca_ratio, pc1_results, paths
+
+
+# =============================================================================
+# 第五部分：统计报告
+# =============================================================================
+def format_report(feature_results, pca_ratio, pc1_results, n_chapters, n_features, saved_paths,
+                  report_path=REPORT_PATH):
+    """组装完整文本报告（检验结果在前，PCA 信息在后）。"""
+    sep = '=' * 60
+    pc_labels = ', '.join(f'PC{i + 1}' for i in range(len(pca_ratio)))
+    lines = []
+
+    def add(text=''):
+        lines.append(text)
+
+    # ----- 数据概况 -----
+    add(sep)
+    add('数据概况')
+    add(sep)
+    add(f'  章节数: {n_chapters}')
+    add(f'  特征维度 V: {n_features}')
+    add(f'  前 80 回样本量: {N_FRONT}')
+    add(f'  后 40 回样本量: {n_chapters - N_FRONT}')
+
+    # ----- 全特征检验（核心推断，优先呈现）-----
+    add(f'\n{sep}')
+    add(f'一、全特征逐词检验（{n_features} 特征）')
+    add(sep)
+    add('  [Mann-Whitney U 检验 + 多重比较校正]')
+    add(f'  原始 p < {ALPHA} 的特征数: {feature_results["sig_raw"]}')
+    add(f'  Bonferroni 校正后显著: {feature_results["sig_bonferroni"]}')
+    add(f'  FDR (BH) 校正后显著: {feature_results["sig_fdr"]}')
+    add('\n  Top 10 差异词（按原始 p 值排序）:')
+    add(f'  {"词语":<12} {"U":>10} {"p":>12} {"Bonf.p":>12} {"FDR.p":>12} {"r":>8}')
+    for rec in feature_results['top_records'][:10]:
+        add(f'  {rec["word"]:<12} {rec["U"]:>10.1f} {rec["p"]:>12.4e} '
+            f'{rec["bonferroni_p"]:>12.4e} {rec["fdr_p"]:>12.4e} {rec["rank_biserial_r"]:>8.4f}')
+
+    add(f'\n  代表性特征补充检验（Top {len(feature_results["representative"])}，Mann-Whitney + KS）:')
+    add(f'  {"词语":<12} {"MW.p":>12} {"KS D":>8} {"KS p":>12} {"r":>8}')
+    for rec in feature_results['representative']:
+        add(f'  {rec["word"]:<12} {rec["p"]:>12.4e} {rec["ks_D"]:>8.4f} '
+            f'{rec["ks_p"]:>12.4e} {rec["rank_biserial_r"]:>8.4f}')
+
+    # ----- PCA 降维 + PC1 补充检验 -----
+    add(f'\n{sep}')
+    add('二、PCA 降维与 PC1 补充检验')
+    add(sep)
+    add(f'  主成分数: {len(pca_ratio)}')
+    for i, ratio in enumerate(pca_ratio, 1):
+        add(f'  PC{i} 解释方差比: {ratio:.4f} ({ratio * 100:.2f}%)')
+    add(f'  {pc_labels} 累计解释率: {pca_ratio.sum():.4f} ({pca_ratio.sum() * 100:.2f}%)')
+    add('  说明: PC1 解释方差最大，对其做 Mann-Whitney / KS / 置换检验作为 PCA 方向的补充验证。')
+
+    mw = pc1_results['mann_whitney']
+    ks = pc1_results['ks']
+    perm = pc1_results['permutation']
+    add('\n  [PC1 — Mann-Whitney U 检验]')
+    add(f'    U={mw["U"]:.1f}, p={mw["p"]:.4e}, rank-biserial r={mw["rank_biserial_r"]:.4f}')
+    add('  [PC1 — Kolmogorov-Smirnov 两样本检验]')
+    add(f'    D={ks["statistic"]:.4f}, p={ks["p"]:.4e}')
+    add('  [PC1 — 置换检验（两组 PC1 均值差的绝对值）]')
+    add(f'    T_obs={perm["T_obs"]:.6f}, p_perm={perm["p"]:.4e}, 置换次数={perm["n_perm"]}')
+
+    # ----- 综合结论 -----
+    add(f'\n{sep}')
+    add('结论')
+    add(sep)
+    evidence = []
+    if feature_results['sig_raw'] > 0:
+        evidence.append(f'原始检验有 {feature_results["sig_raw"]} 个词语 p < {ALPHA}')
+    if feature_results['sig_bonferroni'] > 0:
+        evidence.append(f'Bonferroni 校正后有 {feature_results["sig_bonferroni"]} 个词语显著')
+    if feature_results['sig_fdr'] > 0:
+        evidence.append(f'FDR 校正后有 {feature_results["sig_fdr"]} 个词语显著差异')
+    rep_sig_ks = sum(1 for rec in feature_results['representative'] if rec['ks_p'] < ALPHA)
+    if rep_sig_ks > 0:
+        evidence.append(f'代表性特征中有 {rep_sig_ks} 个 KS 检验显著')
+    if mw['p'] < ALPHA:
+        evidence.append('PC1 Mann-Whitney 检验显著')
+    if ks['p'] < ALPHA:
+        evidence.append('PC1 KS 检验显著')
+    if perm['p'] < ALPHA:
+        evidence.append('PC1 置换检验显著')
+
+    if evidence:
+        add(f'  在 α={ALPHA} 下，全特征非参数检验提示前 80 回与后 40 回存在用词差异：')
+        for item in evidence:
+            add(f'    - {item}')
+        add('  综合而言，用词风格在前后两部分之间并非完全一致，与「后四十回作者存疑」的假设相容。')
+    else:
+        add(f'  在 α={ALPHA} 下，各项检验均未发现显著差异，不能拒绝「前后回风格相同」的假设。')
+
+    add(f'\n{sep}')
+    add('图表已保存')
+    add(sep)
+    for path in saved_paths:
+        add(f'  {path}')
+    add(f'\n{sep}')
+    add('检验报告已保存')
+    add(sep)
+    add(f'  {report_path}')
+
+    return '\n'.join(lines)
+
+
+def save_report(report_text, report_path=REPORT_PATH):
+    """将报告写入 txt 文件。"""
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(report_text)
+    return report_path
+
+
+def print_report(feature_results, pca_ratio, pc1_results, n_chapters, n_features, saved_paths,
+                 report_path=REPORT_PATH):
+    """打印并保存统计报告。"""
+    report_text = format_report(
+        feature_results, pca_ratio, pc1_results, n_chapters, n_features, saved_paths,
+        report_path=report_path,
+    )
+    print(report_text, flush=True)
+    save_report(report_text, report_path=report_path)
+
+
+# =============================================================================
+# 主流程
+# =============================================================================
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # ---- 步骤 0：预处理，构建特征矩阵 ----
+    print('【步骤 0】文本预处理与特征构建...')
+    features, word_list, chapter_ids = prepare_features()
+
+    # ---- 步骤 1：全特征非参数检验（核心推断）----
+    print('【步骤 1】全特征 Mann-Whitney 检验 + 多重比较校正...')
+    feature_results = feature_wise_tests(features, word_list)
+
+    print('【步骤 1】生成检验相关图表...')
+    feature_plot_paths = run_feature_visualization(features, feature_results)
+
+    # ---- 步骤 2：PCA 降维 + PC1 补充检验 ----
+    print('【步骤 2】PCA 降维、PC1 三项检验与可视化...')
+    _, pca_ratio, pc1_results, pca_plot_paths = run_pca_analysis(features)
+
+    saved_paths = feature_plot_paths + pca_plot_paths
+
+    # ---- 步骤 3：输出报告 ----
+    print('【步骤 3】输出统计报告...')
+    print_report(
+        feature_results, pca_ratio, pc1_results,
+        n_chapters=len(chapter_ids), n_features=len(word_list), saved_paths=saved_paths,
+    )
+
+    if SHOW_PLOTS:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()
